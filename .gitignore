@@ -1,0 +1,39 @@
+# ── 环境变量（含 API 密钥，绝不能提交）──
+.env
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# ── 日志 ──
+*.log
+
+# ── 运行时文件 ──
+.server_pid
+server_stderr.log
+server_stdout.log
+
+# ── IDE ──
+.vscode/
+.idea/
+
+# ── Docker 数据卷（运行时数据）──
+volumes/
+
+# ── 上传文件（运行时生成）──
+chat_uploads/
+
+# ── 图片（运行时生成/上传）──
+images/
+
+# ── 知识库文档（用户数据）──
+knowledge_base/
+
+# ── OS ──
+.DS_Store
+Thumbs.db
