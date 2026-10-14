@@ -114,6 +114,15 @@ def create_tools(
             query: 图片描述关键字，如"控油面膜"、"口红试色"
             limit: 返回图片数量 (1-10)，默认 5
         """
+        if os.getenv("DEMO_MODE", "").strip().lower() in {"1", "true", "yes", "on"}:
+            return json.dumps(
+                {
+                    "message": "公网演示模式未启用图片向量库，可继续体验知识库问答和 Agent 对话。",
+                    "images": [],
+                },
+                ensure_ascii=False,
+            )
+
         from pymilvus import MilvusClient
         from utils.multimodal import embed_text_for_image_search
 

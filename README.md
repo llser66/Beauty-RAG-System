@@ -163,3 +163,13 @@ python -m py_compile main.py app_frontend.py agent\tools.py agent\orchestrator.p
 ```
 
 外部模型、SiliconFlow 和 Milvus 没有启动时，接口联调无法完成；这不影响纯函数测试和语法检查。
+
+## 公网演示部署
+
+仓库现在包含一个适合 Render 免费 Web Service 的演示模式：
+
+- DEMO_MODE=true 时使用 demo_knowledge_base/ 的轻量关键词检索，不启动 Milvus、CLIP 或 BGE 大模型；
+- Docker 容器会先启动 FastAPI，再启动 Streamlit，Render 的公网端口由 PORT 环境变量注入；
+- 需要在 Render 环境变量中配置 SILICONFLOW_API_KEY、SILICONFLOW_BASE_URL 和随机的 API_BEARER_TOKEN；
+- 免费实例会在空闲后休眠，上传文件和运行时数据不保证持久保存，因此它适合项目演示，不等同于生产部署；
+- 本地完整模式仍按上面的 Milvus + start.bat 流程运行。

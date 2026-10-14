@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import mimetypes
+import re
 import time
 import traceback
 from datetime import datetime, timezone
@@ -77,6 +78,9 @@ class Settings:
     )
     ENV: str = os.getenv("ENV", "production")
     API_PORT: int = int(os.getenv("API_PORT", "8877"))
+    DEMO_MODE: bool = os.getenv("DEMO_MODE", "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
 
 
 settings = Settings()
@@ -143,6 +147,33 @@ def chunk_documents(docs: List[Document]) -> List[Document]:
     return splitter.split_documents(docs)
 
 
+class KeywordDocumentStore:
+    """公网演示模式使用的轻量文本检索器。"""
+
+    def __init__(self, documents: List[Document]):
+        self.documents = list(documents)
+        self._tokens = [self._tokenize(doc.page_content) for doc in self.documents]
+
+    @staticmethod
+    def _tokenize(text: str) -> set[str]:
+        return set(re.findall(r"[\u4e00-\u9fff]|[a-z0-9_]+", text.lower()))
+
+    def similarity_search(self, query: str, k: int = 5) -> List[Document]:
+        limit = max(1, min(int(k), 20))
+        query_text = str(query or "").strip().lower()
+        query_tokens = self._tokenize(query_text)
+        scored = []
+        for index, (doc, tokens) in enumerate(zip(self.documents, self._tokens)):
+            overlap = len(query_tokens & tokens)
+            phrase_bonus = 2 if query_text and query_text in doc.page_content.lower() else 0
+            scored.append((overlap + phrase_bonus, -index, doc))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        selected = [item[2] for item in scored[:limit]]
+        if not selected or scored[0][0] == 0:
+            return self.documents[:limit]
+        return selected
+
+
 async def _retrieve_rerank_context(question: str) -> tuple[List[Document], str]:
     """
     文本检索 + BGE 重排，返回 (top_docs, context_str)
@@ -156,16 +187,19 @@ async def _retrieve_rerank_context(question: str) -> tuple[List[Document], str]:
         text_store.similarity_search, question, k=settings.RERANK_TOP_K * 3 + 2
     )
 
-    # 精排（异步化，避免阻塞）
-    try:
-        loop = asyncio.get_running_loop()
-        reranked = await loop.run_in_executor(
-            None, rerank_documents, question, raw_docs, settings.RERANK_TOP_K
-        )
-        top_docs = [item[0] for item in reranked]
-    except Exception as e:
-        logger.warning(f"重排异常，回退原始排序: {e}")
+    if settings.DEMO_MODE:
         top_docs = raw_docs[: settings.RERANK_TOP_K]
+    else:
+        # 精排（异步化，避免阻塞）
+        try:
+            loop = asyncio.get_running_loop()
+            reranked = await loop.run_in_executor(
+                None, rerank_documents, question, raw_docs, settings.RERANK_TOP_K
+            )
+            top_docs = [item[0] for item in reranked]
+        except Exception as e:
+            logger.warning(f"重排异常，回退原始排序: {e}")
+            top_docs = raw_docs[: settings.RERANK_TOP_K]
 
     context = "\n\n".join(doc.page_content for doc in top_docs)
     return top_docs, context
@@ -175,6 +209,9 @@ async def _search_similar_images(question: str) -> List[Dict[str, Any]]:
     """
     基于文本搜索相关图片，返回图片信息列表
     """
+    if settings.DEMO_MODE:
+        return []
+
     global milvus_client
     if milvus_client is None:
         logger.error("图片检索客户端未初始化")
@@ -271,6 +308,10 @@ async def rebuild_text_index():
         all_docs = scan_knowledge_base(settings.KNOWLEDGE_DIR)
         if not all_docs:
             raise RuntimeError("未扫描到任何文档！")
+        if settings.DEMO_MODE:
+            text_store = KeywordDocumentStore(chunk_documents(all_docs))
+            logger.info(f"✅ 演示文本索引就绪，共 {len(text_store.documents)} 个文本块")
+            return
         chunked = chunk_documents(all_docs)
         logger.info(f"切片后共 {len(chunked)} 个文本块")
 
@@ -298,6 +339,9 @@ async def rebuild_image_index():
     global milvus_client
     async with rebuild_lock:
         logger.info("🔄 重建图片索引...")
+        if settings.DEMO_MODE:
+            logger.info("ℹ️ 演示模式跳过 Milvus 图片索引")
+            return
         if milvus_client is None:
             raise RuntimeError("Milvus 客户端未初始化")
 
@@ -362,6 +406,15 @@ async def rebuild_image_index():
 def get_kb_stats() -> dict:
     """获取知识库统计（复用全局客户端）"""
     stats = {"text_chunks": 0, "images": 0, "documents": 0}
+    if settings.DEMO_MODE:
+        return {
+            "text_chunks": len(text_store.documents) if text_store else 0,
+            "images": 0,
+            "documents": len([
+                f for f in os.listdir(settings.KNOWLEDGE_DIR)
+                if os.path.isfile(os.path.join(settings.KNOWLEDGE_DIR, f))
+            ]) if os.path.isdir(settings.KNOWLEDGE_DIR) else 0,
+        }
     if milvus_client is None:
         return stats
     try:
@@ -400,6 +453,13 @@ async def lifespan(app: FastAPI):
         )
         if deleted:
             logger.info(f"🧹 已清理 {deleted} 个过期聊天图片")
+        if settings.DEMO_MODE:
+            await rebuild_text_index()
+            ready = True
+            logger.info("✅ 公网演示模式已就绪（关键词检索，无 Milvus）")
+            yield
+            ready = False
+            return
         # 初始化全局 Milvus 客户端
         milvus_client = MilvusClient(uri=settings.MILVUS_URI)
         # 测试连接
@@ -614,7 +674,7 @@ async def agent_chat_endpoint(req: ChatRequest, _=Depends(verify_token)):
             user_query=question,
             llm=llm,
             text_store=text_store,
-            rerank_func=rerank_documents,
+            rerank_func=None if settings.DEMO_MODE else rerank_documents,
             milvus_uri=settings.MILVUS_URI,
             image_collection=settings.IMAGE_COLLECTION,
             stats_func=get_kb_stats,
@@ -648,7 +708,7 @@ async def agent_chat_stream_endpoint(req: ChatRequest, _=Depends(verify_token)):
                 user_query=question,
                 llm=llm,
                 text_store=text_store,
-                rerank_func=rerank_documents,
+                rerank_func=None if settings.DEMO_MODE else rerank_documents,
                 milvus_uri=settings.MILVUS_URI,
                 image_collection=settings.IMAGE_COLLECTION,
                 stats_func=get_kb_stats,
