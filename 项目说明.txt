@@ -1,141 +1,91 @@
-═══════════════════════════════════════════════════════════════
-  Beauty Agent — 美妆护肤 AI 助手 · 项目文件说明
-═══════════════════════════════════════════════════════════════
+Beauty Agent — 改造后的项目说明
+================================
 
-一、核心入口
-───────────────────────────────────────────────────────────────
+一、产品定位
+------------
 
-1. main.py
-   后端主程序 — FastAPI 服务器
-   - 提供 RAG 知识库检索 API（/api/v1/rag/*）
-   - 提供 Agent 自主推理 API（/api/v1/agent/*）
-   - 文档/图片上传、索引重建、知识库统计
-   - 使用 DeepSeek-V3 作为 LLM，Qwen3-Embedding 做向量化
-   - 启动方式：uvicorn main:app --host 0.0.0.0 --port 8001
+这是一个面向美妆护肤场景的 AI 知识助手。用户可以通过 RAG 或 Agent 模式询问成分、产品、护肤流程和内容创作问题，也可以上传皮肤照片进行非医疗性的初步分析。
 
-2. app_frontend.py
-   前端主程序 — Streamlit 交互界面
-   - 深色主题，专业美观的聊天 UI
-   - 支持两种对话模式：Agent 模式 / RAG 模式
-   - Agent 模式显示"思考过程"面板（工具调用步骤）
-   - 图片搜索结果以卡片网格展示
-   - 侧边栏显示知识库统计、文件上传、索引管理
-   - 启动方式：streamlit run app_frontend.py
+二、核心功能
+------------
 
-3. start.bat
-   Windows 一键启动脚本
-   - 检测 .env 配置文件
-   - 启动 Milvus 向量数据库（Docker）
-   - 启动后端（端口 8001）
-   - 启动前端（端口 8501）
+1. RAG 模式
+   - 从 Milvus 检索知识库文本；
+   - 使用 BGE-Reranker 做二次排序；
+   - 调用 DeepSeek-V3 生成回答；
+   - 支持 SSE 流式回答、来源文件和相关图片。
 
-4. requirements.txt
-   Python 依赖清单
-   - FastAPI / Uvicorn（后端框架）
-   - LangChain 全家桶（RAG 流水线）
-   - Milvus / PyMilvus（向量数据库）
-   - Streamlit（前端）
-   - PyMuPDF / python-docx / openpyxl（文档解析）
-   - Transformers / Pillow（CLIP 多模态模型）
+2. Agent 模式
+   - 使用 LangChain Agent 自主决定下一步操作；
+   - 工具包括：搜索知识库、搜索图片、查看知识库统计、分析皮肤照片；
+   - 支持最近 8 条对话历史；
+   - 前端实时展示工具调用步骤和图片结果。
 
+3. 知识库
+   - 支持 TXT、PDF、DOCX、XLSX；
+   - 自动解析和文本切片；
+   - 支持新文件增量入库；
+   - 替换同名文档时自动全量重建，避免旧向量残留；
+   - 当前示例资料包括成分百科、产品库、小红书笔记和文案模板。
 
-二、Agent 核心层（新增）
-───────────────────────────────────────────────────────────────
+4. 图片能力
+   - CLIP 图文向量检索；
+   - 文本搜索本地产品/素材图片；
+   - 对话图片上传后，由视觉模型调用 analyze_skin 工具；
+   - 上传内容会经过大小、扩展名、图片格式和路径校验。
 
-5. agent/__init__.py
-   Agent 包初始化文件，标识 agent/ 为 Python 包
+5. 界面和运维
+   - Streamlit 奶油白、深梅紫、玫瑰金视觉主题；
+   - Agent/RAG 模式切换；
+   - 知识库统计、上传、索引重建；
+   - 后端 `/health` 健康检查；
+   - Docker Compose 启动 Milvus；
+   - Windows `start.bat` 一键启动。
 
-6. agent/tools.py
-   工具定义层 — 把 RAG 能力包装成 LLM 可调用的 Function Calling 工具
-   - 定义 3 个工具：search_knowledge_base（搜知识库）
-                               search_images（搜图片）
-                               get_knowledge_base_stats（看统计）
-   - 每个工具有 JSON Schema 定义（发给 LLM 的参数描述）
-   - 每个工具有异步执行函数（实际调用后端能力）
-   - 工具执行时支持依赖注入（text_store、rerank_func 等）
-   - 使用 BGE-Reranker 对搜索结果精排
+6. 隐私和伦理边界
+   - 上传皮肤照片前必须确认本人或已获得照片本人授权；
+   - 对话图片重新编码并清除 EXIF/GPS 元数据，默认 24 小时自动清理；
+   - 对话图片读取和删除需要 Bearer Token，不再公开挂载静态目录；
+   - 前端明确告知文本和图片可能发送到外部模型服务；
+   - 对孕期、儿童、过敏、用药和紧急症状显示安全提醒，不进行疾病诊断或药物处方。
 
-7. agent/orchestrator.py
-   Agent 编排器 — ReAct（思考→行动→观察）主循环
-   - 定义 Agent 的 System Prompt（角色、能力、行为准则）
-   - run_agent()：非流式版，返回完整答案 + 步骤记录
-   - run_agent_stream()：流式版，逐步 yield 事件
-   - 循环逻辑：调用 LLM（带工具）→ 解析 tool_calls → 执行工具 → 放回消息 → 继续
-   - 直到 LLM 认为信息足够，直接生成最终回答
-   - 有最大迭代次数保护（默认 10 次，防死循环）
+三、主要接口
+------------
 
+后端默认端口：8877。
 
-三、工具模块
-───────────────────────────────────────────────────────────────
+   GET  /health
+   POST /api/v1/rag/chat
+   POST /api/v1/rag/chat/stream
+   POST /api/v1/agent/chat
+   POST /api/v1/agent/chat/stream
+   POST /api/v1/chat/upload_image
+   POST /api/v1/knowledge/upload
+   POST /api/v1/knowledge/rebuild
+   GET  /api/v1/knowledge/stats
+   GET  /api/v1/privacy
+   GET  /api/v1/chat/uploads/{file_id}
+   DELETE /api/v1/chat/uploads/{file_id}
 
-8. utils/document_loader.py
-   多格式文档解析器
-   - 支持 .txt / .pdf / .docx / .xlsx 四种格式
-   - 自动识别文件扩展名并调用对应解析器
-   - 返回 LangChain Document 对象列表
+除 `/health` 和公开的 `/api/v1/privacy` 外的接口使用 Bearer Token 鉴权。Token 不再通过公开接口返回，前端从同一份 `.env` 读取。
 
-9. utils/multimodal.py
-   多模态向量引擎 — CLIP 模型
-   - embed_image()：图片 → 512 维向量
-   - embed_text_for_image_search()：文本 → 512 维向量
-   - 实现图文双路搜索（用文字搜图片）
+图片分析只描述与护肤相关的可观察表现，不推断身份、年龄、种族、健康状态或“美丑”；遇到孕期、儿童、用药、过敏或严重症状时，应咨询医生或药师。
 
-10. utils/reranker.py
-    BGE-Reranker 精细化重排引擎
-    - 对 Milvus 粗召回结果进行深度相关性打分
-    - 使用 BAAI/bge-reranker-v2-m3 交叉编码模型
-    - 自动尝试 HuggingFace 镜像下载
-    - 网络不通时降级为原始排序（不影响核心流程）
+四、启动方式
+------------
 
-11. utils/auth.py
-    API Token 鉴权模块
-    - Bearer Token 方式验证 API 请求
-    - 自动生成 Token（secrets.token_hex）
-    - 自动写入 .env 文件
+1. 复制 `.env.example` 为 `.env`，配置 SiliconFlow API Key；
+2. 安装 `requirements.txt`；
+3. 执行 `docker compose up -d`；
+4. 双击 `start.bat`，或分别运行：
 
+   uvicorn main:app --host 0.0.0.0 --port 8877
+   streamlit run app_frontend.py
 
-四、配置文件
-───────────────────────────────────────────────────────────────
+五、验证命令
+------------
 
-12. docker-compose.yml
-    Docker Compose 配置 — 启动 Milvus 向量数据库 + 依赖服务
+   pytest -q tests
+   python -m py_compile main.py app_frontend.py agent\tools.py agent\orchestrator.py rebuild.py
 
-13. .env（需自行创建）
-    环境变量配置文件
-    - SILICONFLOW_API_KEY：硅基流动 API 密钥
-    - SILICONFLOW_BASE_URL：API 地址
-    - MILVUS_URI：Milvus 连接地址
-    - API_BEARER_TOKEN：API 鉴权 Token
-
-
-五、数据目录
-───────────────────────────────────────────────────────────────
-
-14. knowledge_base/
-    知识库目录 — 放入 .txt/.pdf/.docx/.xlsx 格式的美妆文档
-    启动后自动扫描入库
-
-15. images/
-    图片素材目录 — 放入 .jpg/.png/.webp 格式的美妆图片
-    支持 CLIP 图文检索
-
-
-═══════════════════════════════════════════════════════════════
-  架构说明
-═══════════════════════════════════════════════════════════════
-
-传统 RAG 模式：
-  用户 → 搜索知识库 → 重排 → LLM 生成 → 回答
-
-Agent 模式（本次新增）：
-  用户 → LLM 分析意图 → 决定调用工具
-       ↘ 搜索知识库 → 观察结果 → 继续推理
-       ↘ 搜索图片   → 观察结果 → 继续推理
-       ↘ 查看统计   → 观察结果 → 继续推理
-       → 综合所有信息 → 生成最终回答
-
-Agent 的核心优势：
-  - 可以多次调用不同工具获取多维度信息
-  - 可以观察工具返回结果后决定下一步行动
-  - 回答更全面、更有条理
-  - 可扩展性强（加新工具只需在 tools.py 注册）
+外部模型 API、Milvus 和模型下载属于运行环境依赖，需要在真实部署环境中进一步联调。

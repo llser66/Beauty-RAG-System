@@ -5,6 +5,7 @@ API Token 鉴权模块
 
 import os
 import secrets
+import hmac
 from fastapi import Header, HTTPException
 from typing import Optional
 
@@ -16,7 +17,7 @@ def get_api_token() -> str:
     """获取当前 API Token，不存在则从 .env 读取或自动生成"""
     global _API_TOKEN
     if _API_TOKEN is None:
-        _API_TOKEN = os.getenv("API_BEARER_TOKEN", "")
+        _API_TOKEN = os.getenv("API_BEARER_TOKEN", "").strip()
         if not _API_TOKEN:
             _API_TOKEN = secrets.token_hex(32)
             # 尝试写入 .env
@@ -24,9 +25,9 @@ def get_api_token() -> str:
                 env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
                 with open(env_path, "a", encoding="utf-8") as f:
                     f.write(f'\nAPI_BEARER_TOKEN={_API_TOKEN}\n')
-                print(f"🔑 已自动生成 API Token，已追加到 .env 文件")
+                print("🔑 已自动生成 API Token，并写入 .env")
             except Exception:
-                print(f"🔑 自动生成的 API Token: {_API_TOKEN}")
+                print("🔑 API Token 已生成，但无法写入 .env；请手动配置 API_BEARER_TOKEN")
     return _API_TOKEN
 
 
@@ -40,8 +41,8 @@ async def verify_token(authorization: Optional[str] = Header(None)):
     if not authorization:
         raise HTTPException(status_code=401, detail="缺少 Authorization 头")
 
-    scheme, _, cred = authorization.partition(" ")
-    if scheme.lower() != "bearer" or cred != token:
+    scheme, _, cred = authorization.strip().partition(" ")
+    if scheme.lower() != "bearer" or not cred or not hmac.compare_digest(cred, token):
         raise HTTPException(status_code=401, detail="无效的 API Token")
 
     return True

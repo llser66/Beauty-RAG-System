@@ -1,87 +1,126 @@
 """
-美妆护肤企业级 RAG 引擎 — Milvus 高能版
-多文档 · 多模态 · BGE 重排 · Token 鉴权
+美妆护肤企业级 RAG 引擎 — Milvus 高能版（生产优化）
+多文档 · 多模态 · BGE 重排 · Token 鉴权 · 连接池 · 健康检查
 """
 
+import asyncio
+import hashlib
+import json
+import logging
 import os
+import mimetypes
+import time
+import traceback
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, AsyncGenerator, Literal
+from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Request
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_milvus import Milvus
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
-from pymilvus import MilvusClient, DataType, connections
+from pymilvus import MilvusClient, DataType
 
-from utils.document_loader import scan_knowledge_base
+from utils.document_loader import scan_knowledge_base, load_single_file
 from utils.multimodal import embed_image, embed_text_for_image_search, CLIP_DIM
 from utils.reranker import rerank_documents
 from utils.auth import verify_token, get_api_token
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse
-import hashlib, json, asyncio, time
-
-# ── Agent ──────────────────────────────────────────────
+from utils.validation import (
+    UploadValidationError,
+    clean_question,
+    ensure_within_directory,
+    sanitize_filename,
+)
+from utils.privacy import cleanup_expired_files, normalize_image_bytes
+from utils.safety import assess_question
 from agent.orchestrator import run_agent, run_agent_stream
+
+# ── 日志初始化 ────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+)
+logger = logging.getLogger("beauty_rag")
 
 load_dotenv()
 
-# ── 配置 ──────────────────────────────────────────
-sf_key = os.getenv("SILICONFLOW_API_KEY")
-sf_url = os.getenv("SILICONFLOW_BASE_URL")
-if not sf_key or not sf_url:
+# ── 配置模型 ────────────────────────────────────
+class Settings:
+    """集中管理所有配置，支持环境变量覆盖"""
+    SILICONFLOW_API_KEY: str = os.getenv("SILICONFLOW_API_KEY", "")
+    SILICONFLOW_BASE_URL: str = os.getenv("SILICONFLOW_BASE_URL", "")
+    MILVUS_URI: str = os.getenv("MILVUS_URI", "http://127.0.0.1:19530")
+    TEXT_COLLECTION: str = "text_chunks"
+    IMAGE_COLLECTION: str = "image_embeddings"
+    KNOWLEDGE_DIR: str = os.getenv("KNOWLEDGE_DIR", os.path.join(os.path.dirname(__file__), "knowledge_base"))
+    IMAGE_DIR: str = os.path.join(os.path.dirname(__file__), "images")
+    CHAT_UPLOAD_DIR: str = os.path.join(os.path.dirname(__file__), "chat_uploads")
+    LLM_MODEL: str = "deepseek-ai/DeepSeek-V3"
+    VISION_MODEL: str = "Qwen/Qwen3-VL-8B-Instruct"
+    EMBEDDING_MODEL: str = "Qwen/Qwen3-Embedding-8B"
+    CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "500"))
+    CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "50"))
+    RERANK_TOP_K: int = int(os.getenv("RERANK_TOP_K", "3"))
+    IMAGE_SEARCH_LIMIT: int = int(os.getenv("IMAGE_SEARCH_LIMIT", "5"))
+    IMAGE_MIN_SCORE: float = float(os.getenv("IMAGE_MIN_SCORE", "0.18"))
+    MAX_UPLOAD_SIZE_MB: int = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50"))
+    CHAT_UPLOAD_RETENTION_HOURS: int = max(
+        1, int(os.getenv("CHAT_UPLOAD_RETENTION_HOURS", "24"))
+    )
+    ENV: str = os.getenv("ENV", "production")
+    API_PORT: int = int(os.getenv("API_PORT", "8877"))
+
+
+settings = Settings()
+
+if not settings.SILICONFLOW_API_KEY or not settings.SILICONFLOW_BASE_URL:
     raise RuntimeError("请在 .env 中配置 SILICONFLOW_API_KEY 和 SILICONFLOW_BASE_URL")
 
-MILVUS_URI = os.getenv("MILVUS_URI", "http://127.0.0.1:19530")
-TEXT_COLLECTION = "text_chunks"
-IMAGE_COLLECTION = "image_embeddings"
-KNOWLEDGE_DIR = os.getenv("KNOWLEDGE_DIR", os.path.join(os.path.dirname(__file__), "knowledge_base"))
-IMAGE_DIR = os.path.join(os.path.dirname(__file__), "images")
+# 确保目录存在
+for path in [settings.KNOWLEDGE_DIR, settings.IMAGE_DIR, settings.CHAT_UPLOAD_DIR]:
+    os.makedirs(path, exist_ok=True)
 
-os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
-os.makedirs(IMAGE_DIR, exist_ok=True)
-CHAT_UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "chat_uploads")
-os.makedirs(CHAT_UPLOAD_DIR, exist_ok=True)
+# ── 全局状态与锁 ─────────────────────────────────
+text_store: Optional[Milvus] = None
+milvus_client: Optional[MilvusClient] = None
+rebuild_lock = asyncio.Lock()
+ready = False  # 服务就绪标志
 
 # ── LLM & Embeddings ──────────────────────────────
 llm = ChatOpenAI(
-    api_key=sf_key, base_url=sf_url,
-    model="deepseek-ai/DeepSeek-V3", temperature=0.1
+    api_key=settings.SILICONFLOW_API_KEY,
+    base_url=settings.SILICONFLOW_BASE_URL,
+    model=settings.LLM_MODEL,
+    temperature=0.1,
 )
-# 视觉模型（用于分析皮肤照片）
+
 vision_llm = ChatOpenAI(
-    api_key=sf_key, base_url=sf_url,
-    model="Qwen/Qwen3-VL-8B-Instruct", temperature=0.1,
+    api_key=settings.SILICONFLOW_API_KEY,
+    base_url=settings.SILICONFLOW_BASE_URL,
+    model=settings.VISION_MODEL,
+    temperature=0.1,
     max_tokens=1024,
 )
+
 embeddings = OpenAIEmbeddings(
-    api_key=sf_key, openai_api_base=sf_url,
-    model="Qwen/Qwen3-Embedding-8B"
+    api_key=settings.SILICONFLOW_API_KEY,
+    openai_api_base=settings.SILICONFLOW_BASE_URL,
+    model=settings.EMBEDDING_MODEL,
 )
 
-# ── 全局状态 ───────────────────────────────────────
-text_store: Optional[Milvus] = None
-
-
-# ── MD5 文件指纹（内容去重）───────────────────────
-def compute_md5(data: bytes) -> str:
-    return hashlib.md5(data).hexdigest()
-
-
-# ── 文本切片 ───────────────────────────────────────
-def chunk_documents(docs: List[Document]) -> List[Document]:
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    return splitter.split_documents(docs)
-
-
-# ── 重排 RAG 对话 ──────────────────────────────────
+# ── RAG 提示模板 ─────────────────────────────────
 RAG_PROMPT = ChatPromptTemplate.from_template("""
-你是一位精通小红书美妆爆文逻辑的文案专家。请严格根据下方提供的上下文回答用户问题。
+你是一位专业、克制、可信的美妆护肤顾问。请严格根据下方提供的上下文回答用户问题。
+如果上下文没有足够依据，请明确说明，不要编造品牌、价格或功效；涉及皮肤疾病、孕期或严重过敏时，提醒用户咨询专业医生。
+安全边界：{safety_instruction}
 
 上下文：
 {context}
@@ -91,410 +130,468 @@ RAG_PROMPT = ChatPromptTemplate.from_template("""
 """)
 
 
-async def chat_with_rerank(question: str) -> dict:
+# ── 工具函数 ─────────────────────────────────────
+def compute_md5(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()
+
+
+def chunk_documents(docs: List[Document]) -> List[Document]:
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=settings.CHUNK_SIZE,
+        chunk_overlap=settings.CHUNK_OVERLAP,
+    )
+    return splitter.split_documents(docs)
+
+
+async def _retrieve_rerank_context(question: str) -> tuple[List[Document], str]:
     """
-    完整 RAG 流水线：粗搜 → 重排 → LLM 生成 + 图片检索
+    文本检索 + BGE 重排，返回 (top_docs, context_str)
     """
     global text_store
-
     if text_store is None:
-        raise HTTPException(status_code=500, detail="文本引擎未初始化")
+        raise HTTPException(status_code=503, detail="文本检索引擎未就绪")
 
-    # 1. 文本粗召回 top 10
-    raw_docs = text_store.similarity_search(question, k=10)
+    # 粗召回
+    raw_docs = await asyncio.to_thread(
+        text_store.similarity_search, question, k=settings.RERANK_TOP_K * 3 + 2
+    )
 
-    # 2. BGE-Reranker 精排 → top 3（带容错）
+    # 精排（异步化，避免阻塞）
     try:
-        reranked = rerank_documents(question, raw_docs, top_k=3)
+        loop = asyncio.get_running_loop()
+        reranked = await loop.run_in_executor(
+            None, rerank_documents, question, raw_docs, settings.RERANK_TOP_K
+        )
         top_docs = [item[0] for item in reranked]
-        top_scores = [round(item[1], 4) for item in reranked]
     except Exception as e:
-        print(f"⚠️ 重排异常，使用原始排序: {e}")
-        top_docs = raw_docs[:3]
-        top_scores = []
+        logger.warning(f"重排异常，回退原始排序: {e}")
+        top_docs = raw_docs[: settings.RERANK_TOP_K]
 
-    # 3. 构建上下文
     context = "\n\n".join(doc.page_content for doc in top_docs)
+    return top_docs, context
 
-    # 4. LLM 生成
-    messages = RAG_PROMPT.format_messages(context=context, question=question)
-    result = await llm.ainvoke(messages)
 
-    # 5. 图片检索（独立连接，避免冲突）
+async def _search_similar_images(question: str) -> List[Dict[str, Any]]:
+    """
+    基于文本搜索相关图片，返回图片信息列表
+    """
+    global milvus_client
+    if milvus_client is None:
+        logger.error("图片检索客户端未初始化")
+        return []
+
     matched_images = []
     try:
-        connections.connect(alias="image_conn", uri=MILVUS_URI)
-        ic = MilvusClient(alias="image_conn")
-        query_vec = embed_text_for_image_search(question)
-        img_results = ic.search(
-            collection_name=IMAGE_COLLECTION,
+        query_vec = await asyncio.to_thread(embed_text_for_image_search, question)
+        img_results = await asyncio.to_thread(
+            milvus_client.search,
+            collection_name=settings.IMAGE_COLLECTION,
             data=[query_vec.tolist()],
-            limit=5,
+            limit=settings.IMAGE_SEARCH_LIMIT,
             output_fields=["filepath", "filename", "tags"],
         )
         if img_results and img_results[0]:
-            MIN_SCORE = 0.18
             for hit in img_results[0]:
                 score = round(hit["distance"], 4)
-                if score < MIN_SCORE:
+                if score < settings.IMAGE_MIN_SCORE:
                     continue
                 matched_images.append({
                     "path": f"/static/images/{hit['entity']['filename']}",
-                    "filename": hit["entity"]["filename"],
+                    "filename": hit['entity']['filename'],
                     "score": score,
-                    "tags": hit["entity"].get("tags", ""),
+                    "tags": hit['entity'].get("tags", ""),
                 })
-        ic.close()
-        connections.disconnect("image_conn")
     except Exception as e:
-        print(f"⚠️ 图片检索异常: {e}")
+        logger.error(f"图片检索异常: {e}\n{traceback.format_exc()}")
 
+    return matched_images
+
+
+# ── 核心 RAG 流水线（同步 + 流式）──────────────
+async def chat_with_rerank(question: str) -> dict:
+    """
+    完整 RAG：检索 → 重排 → LLM 生成 + 图片检索
+    """
+    top_docs, context = await _retrieve_rerank_context(question)
+
+    # LLM 生成与图片搜索并行
+    assessment = assess_question(question)
+    messages = RAG_PROMPT.format_messages(
+        context=context,
+        question=question,
+        safety_instruction=assessment.instruction,
+    )
+    llm_task = asyncio.create_task(llm.ainvoke(messages))
+    img_task = asyncio.create_task(_search_similar_images(question))
+
+    result = await llm_task
+    matched_images = await img_task
+
+    sources = list(set(d.metadata.get("source", "") for d in top_docs))
     return {
         "answer": result.content,
-        "rerank_scores": [{"index": i, "score": s} for i, s in enumerate(top_scores)],
         "images": matched_images,
-        "context_sources": list(set(d.metadata.get("source", "") for d in top_docs)),
+        "context_sources": sources,
+        "safety_notice": assessment.notice or None,
     }
 
 
-# ── 流式 RAG 流水线（SSE 打字机）────────────────
-async def chat_with_rerank_stream(question: str):
+async def chat_with_rerank_stream(question: str) -> AsyncGenerator[dict, None]:
     """
-    流式 RAG：检索 → 重排 → 流式 LLM 生成 → 图片检索
-    用于 SSE /api/v1/rag/chat/stream 端点
+    流式 RAG：检索 → 重排 → 流式 LLM + 并行图片检索
     """
-    global text_store
-    if text_store is None:
-        yield {"type": "error", "content": "文本引擎未初始化"}
-        return
+    top_docs, context = await _retrieve_rerank_context(question)
+    assessment = assess_question(question)
+    if assessment.notice:
+        yield {"type": "safety", "content": assessment.notice}
+    messages = RAG_PROMPT.format_messages(
+        context=context,
+        question=question,
+        safety_instruction=assessment.instruction,
+    )
 
-    # 1. 文本粗召回 top 10
-    raw_docs = text_store.similarity_search(question, k=10)
+    img_task = asyncio.create_task(_search_similar_images(question))
 
-    # 2. BGE-Reranker 精排 → top 3
-    try:
-        reranked = rerank_documents(question, raw_docs, top_k=3)
-        top_docs = [item[0] for item in reranked]
-    except Exception as e:
-        print(f"⚠️ 重排异常，使用原始排序: {e}")
-        top_docs = raw_docs[:3]
-
-    # 3. 构建上下文
-    context = "\n\n".join(doc.page_content for doc in top_docs)
-    messages = RAG_PROMPT.format_messages(context=context, question=question)
-
-    # 4. 流式 LLM 生成（逐 chunk 推送）
+    # 直接转发模型流，避免先把所有 token 收集完才返回。
     async for chunk in llm.astream(messages):
-        yield {"type": "text", "content": chunk.content}
+        if chunk.content:
+            yield {"type": "text", "content": chunk.content}
 
-    # 5. 图片检索
-    matched_images = []
-    try:
-        connections.connect(alias="image_conn", uri=MILVUS_URI)
-        ic = MilvusClient(alias="image_conn")
-        query_vec = embed_text_for_image_search(question)
-        img_results = ic.search(
-            collection_name=IMAGE_COLLECTION,
-            data=[query_vec.tolist()],
-            limit=5,
-            output_fields=["filepath", "filename", "tags"],
-        )
-        if img_results and img_results[0]:
-            MIN_SCORE = 0.18
-            for hit in img_results[0]:
-                score = round(hit["distance"], 4)
-                if score < MIN_SCORE:
-                    continue
-                matched_images.append({
-                    "path": f"/static/images/{hit['entity']['filename']}",
-                    "filename": hit["entity"]["filename"],
-                    "score": score,
-                    "tags": hit["entity"].get("tags", ""),
-                })
-        ic.close()
-        connections.disconnect("image_conn")
-    except Exception as e:
-        print(f"⚠️ 图片检索异常: {e}")
-
+    # 再推送图片和元数据
+    matched_images = await img_task
     sources = list(set(d.metadata.get("source", "") for d in top_docs))
     yield {"type": "metadata", "images": matched_images, "sources": sources}
 
 
-# ── 重建 Milvus 索引 ──────────────────────────────
-def rebuild_text_index():
-    """全量重建文本向量索引"""
-    global text_store
-    print("🔄 重建文本索引...")
+# ── 索引重建（带锁保护）────────────────────────
+async def rebuild_text_index():
+    global text_store, milvus_client
+    async with rebuild_lock:
+        logger.info("🔄 重建文本索引...")
+        all_docs = scan_knowledge_base(settings.KNOWLEDGE_DIR)
+        if not all_docs:
+            raise RuntimeError("未扫描到任何文档！")
+        chunked = chunk_documents(all_docs)
+        logger.info(f"切片后共 {len(chunked)} 个文本块")
 
-    # 扫描文档
-    all_docs = scan_knowledge_base(KNOWLEDGE_DIR)
-    if not all_docs:
-        raise RuntimeError("未扫描到任何文档！")
+        # 删除旧集合
+        if milvus_client and milvus_client.has_collection(settings.TEXT_COLLECTION):
+            milvus_client.drop_collection(settings.TEXT_COLLECTION)
 
-    # 切片
-    chunked = chunk_documents(all_docs)
-    print(f"  切片后共 {len(chunked)} 个文本块")
-
-    # 删除旧集合并重建
-    connections.connect(alias="rebuild_conn", uri=MILVUS_URI)
-    rc = MilvusClient(alias="rebuild_conn")
-    if rc.has_collection(TEXT_COLLECTION):
-        rc.drop_collection(TEXT_COLLECTION)
-    rc.close()
-    connections.disconnect("rebuild_conn")
-
-    text_store = Milvus.from_documents(
-        documents=chunked,
-        embedding=embeddings,
-        connection_args={"uri": MILVUS_URI},
-        collection_name=TEXT_COLLECTION,
-        drop_old=True,
-    )
-    # 确保数据落盘
-    try:
-        connections.connect(alias="flush_conn", uri=MILVUS_URI)
-        fc = MilvusClient(alias="flush_conn")
-        fc.flush(collection_name=TEXT_COLLECTION)
-        fc.close()
-        connections.disconnect("flush_conn")
-    except Exception:
-        pass
-    print(f"✅ 文本索引重建完成，共 {len(chunked)} 个向量")
-
-
-def rebuild_image_index():
-    """全量重建图片向量索引"""
-    print("🔄 重建图片索引...")
-
-    connections.connect(alias="image_conn", uri=MILVUS_URI)
-    ic = MilvusClient(alias="image_conn")
-
-    # 删除旧集合
-    if ic.has_collection(IMAGE_COLLECTION):
-        ic.drop_collection(IMAGE_COLLECTION)
-
-    # 创建新集合：512维 CLIP 向量
-    schema = ic.create_schema(auto_id=True, enable_dynamic_field=True)
-    schema.add_field("id", DataType.INT64, is_primary=True, auto_id=True)
-    schema.add_field("vector", DataType.FLOAT_VECTOR, dim=CLIP_DIM)
-    schema.add_field("filepath", DataType.VARCHAR, max_length=500)
-    schema.add_field("filename", DataType.VARCHAR, max_length=255)
-
-    index_params = ic.prepare_index_params()
-    index_params.add_index("vector", metric_type="IP", index_type="IVF_FLAT", params={"nlist": 128})
-
-    ic.create_collection(
-        collection_name=IMAGE_COLLECTION,
-        schema=schema,
-        index_params=index_params,
-    )
-
-    # 扫描 images/ 目录，逐张嵌入
-    image_extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-    image_files = []
-    for ext in image_extensions:
-        for p in Path(IMAGE_DIR).glob(f"*{ext}"):
-            image_files.append(p)
-        for p in Path(IMAGE_DIR).glob(f"*{ext.upper()}"):
-            image_files.append(p)
-
-    if not image_files:
-        print("⚠️ images/ 目录没有图片")
-        ic.close()
-        connections.disconnect("image_conn")
-        return
-
-    inserted = 0
-    for img_path in image_files:
+        # 重建
+        text_store = Milvus.from_documents(
+            documents=chunked,
+            embedding=embeddings,
+            connection_args={"uri": settings.MILVUS_URI},
+            collection_name=settings.TEXT_COLLECTION,
+            drop_old=True,
+        )
+        # 确保落盘
         try:
-            vec = embed_image(str(img_path))
-            # 用文件名生成描述标签
-            tags = f"美妆产品,护肤品,美容"
-            ic.insert(
-                collection_name=IMAGE_COLLECTION,
-                data=[{
-                    "vector": vec.tolist(),
-                    "filepath": str(img_path),
-                    "filename": img_path.name,
-                    "tags": tags,
-                }]
-            )
-            inserted += 1
-            print(f"  🖼️  {img_path.name} → 已入库")
+            milvus_client.flush(collection_name=settings.TEXT_COLLECTION)
         except Exception as e:
-            print(f"  ❌ {img_path.name} 处理失败: {e}")
-
-    # 创建索引
-    ic.flush(collection_name=IMAGE_COLLECTION)
-    ic.load_collection(IMAGE_COLLECTION)
-    ic.close()
-    connections.disconnect("image_conn")
-    print(f"✅ 图片索引重建完成，共 {inserted} 张")
+            logger.warning(f"flush 文本集合失败: {e}")
+        logger.info(f"✅ 文本索引重建完成，共 {len(chunked)} 个向量")
 
 
-# ── 统计 ──────────────────────────────────────────
+async def rebuild_image_index():
+    global milvus_client
+    async with rebuild_lock:
+        logger.info("🔄 重建图片索引...")
+        if milvus_client is None:
+            raise RuntimeError("Milvus 客户端未初始化")
+
+        # 删除旧集合
+        if milvus_client.has_collection(settings.IMAGE_COLLECTION):
+            milvus_client.drop_collection(settings.IMAGE_COLLECTION)
+
+        # 创建集合
+        schema = milvus_client.create_schema(auto_id=True, enable_dynamic_field=True)
+        schema.add_field("id", DataType.INT64, is_primary=True, auto_id=True)
+        schema.add_field("vector", DataType.FLOAT_VECTOR, dim=CLIP_DIM)
+        schema.add_field("filepath", DataType.VARCHAR, max_length=500)
+        schema.add_field("filename", DataType.VARCHAR, max_length=255)
+
+        index_params = milvus_client.prepare_index_params()
+        index_params.add_index("vector", metric_type="IP", index_type="IVF_FLAT", params={"nlist": 128})
+
+        milvus_client.create_collection(
+            collection_name=settings.IMAGE_COLLECTION,
+            schema=schema,
+            index_params=index_params,
+        )
+
+        # 扫描图片
+        image_extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+        image_files = []
+        for ext in image_extensions:
+            for p in Path(settings.IMAGE_DIR).glob(f"*{ext}"):
+                image_files.append(p)
+            for p in Path(settings.IMAGE_DIR).glob(f"*{ext.upper()}"):
+                image_files.append(p)
+
+        if not image_files:
+            logger.warning("⚠️ images/ 目录没有图片")
+            milvus_client.load_collection(settings.IMAGE_COLLECTION)
+            return
+
+        inserted = 0
+        for img_path in image_files:
+            try:
+                vec = embed_image(str(img_path))
+                tags = "美妆产品,护肤品,美容"
+                milvus_client.insert(
+                    collection_name=settings.IMAGE_COLLECTION,
+                    data=[{
+                        "vector": vec.tolist(),
+                        "filepath": str(img_path),
+                        "filename": img_path.name,
+                        "tags": tags,
+                    }]
+                )
+                inserted += 1
+                logger.info(f"🖼️ {img_path.name} → 已入库")
+            except Exception as e:
+                logger.error(f"❌ {img_path.name} 处理失败: {e}")
+
+        milvus_client.flush(collection_name=settings.IMAGE_COLLECTION)
+        milvus_client.load_collection(settings.IMAGE_COLLECTION)
+        logger.info(f"✅ 图片索引重建完成，共 {inserted} 张")
+
+
 def get_kb_stats() -> dict:
-    """获取知识库统计"""
-    stats = {
-        "text_chunks": 0,
-        "images": 0,
-        "documents": 0,
-    }
+    """获取知识库统计（复用全局客户端）"""
+    stats = {"text_chunks": 0, "images": 0, "documents": 0}
+    if milvus_client is None:
+        return stats
     try:
-        connections.connect(alias="image_conn", uri=MILVUS_URI)
-        client = MilvusClient(alias="image_conn")
-        # Flush 确保持久化，保证 row_count 准确
-        try:
-            if client.has_collection(TEXT_COLLECTION):
-                client.flush(collection_name=TEXT_COLLECTION)
-            if client.has_collection(IMAGE_COLLECTION):
-                client.flush(collection_name=IMAGE_COLLECTION)
-        except Exception:
-            pass
-        if client.has_collection(TEXT_COLLECTION):
-            s = client.get_collection_stats(TEXT_COLLECTION)
+        if milvus_client.has_collection(settings.TEXT_COLLECTION):
+            milvus_client.flush(collection_name=settings.TEXT_COLLECTION)
+            s = milvus_client.get_collection_stats(settings.TEXT_COLLECTION)
             stats["text_chunks"] = s.get("row_count", 0)
-        if client.has_collection(IMAGE_COLLECTION):
-            s = client.get_collection_stats(IMAGE_COLLECTION)
+        if milvus_client.has_collection(settings.IMAGE_COLLECTION):
+            milvus_client.flush(collection_name=settings.IMAGE_COLLECTION)
+            s = milvus_client.get_collection_stats(settings.IMAGE_COLLECTION)
             stats["images"] = s.get("row_count", 0)
-        client.close()
-        connections.disconnect("image_conn")
     except Exception as e:
-        print(f"统计读取异常: {e}")
+        logger.error(f"统计获取异常: {e}")
 
-    if os.path.isdir(KNOWLEDGE_DIR):
-        stats["documents"] = len([f for f in os.listdir(KNOWLEDGE_DIR)
-                                  if os.path.isfile(os.path.join(KNOWLEDGE_DIR, f))])
+    if os.path.isdir(settings.KNOWLEDGE_DIR):
+        stats["documents"] = len([
+            f for f in os.listdir(settings.KNOWLEDGE_DIR)
+            if os.path.isfile(os.path.join(settings.KNOWLEDGE_DIR, f))
+        ])
     return stats
 
 
-# ── Lifespan ──────────────────────────────────────
+# ── Lifespan：启动/关闭 ─────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global text_store
-    print("🚀 美妆 RAG 引擎启动中...")
+    global text_store, milvus_client, ready
+    logger.info("🚀 美妆 RAG 引擎启动中...")
 
     try:
-        # 为图片操作创建独立连接（避免与 text_store 的默认连接冲突）
-        connections.connect(alias="image_conn", uri=MILVUS_URI)
-        image_client = MilvusClient(alias="image_conn")
+        # 启动时初始化 Token，前端可从同一份 .env 读取，避免公开返回密钥。
+        get_api_token()
+        deleted = await asyncio.to_thread(
+            cleanup_expired_files,
+            settings.CHAT_UPLOAD_DIR,
+            settings.CHAT_UPLOAD_RETENTION_HOURS,
+        )
+        if deleted:
+            logger.info(f"🧹 已清理 {deleted} 个过期聊天图片")
+        # 初始化全局 Milvus 客户端
+        milvus_client = MilvusClient(uri=settings.MILVUS_URI)
+        # 测试连接
+        milvus_client.list_collections()
+        logger.info("✅ Milvus 连接成功")
 
-        # 检查 Milvus 是否已有数据
-        has_text = image_client.has_collection(TEXT_COLLECTION)
-        has_image = image_client.has_collection(IMAGE_COLLECTION)
-
-        if has_text:
-            # 检查是否为空（使用 get_collection_stats）
-            try:
-                stats = image_client.get_collection_stats(TEXT_COLLECTION)
-                text_count = stats.get("row_count", 0)
-            except Exception:
-                text_count = 0
-            if text_count == 0:
-                print("  文本索引为空，触发重建...")
-                image_client.close()
-                connections.disconnect("image_conn")
-                rebuild_text_index()
+        # 文本索引处理
+        if milvus_client.has_collection(settings.TEXT_COLLECTION):
+            stats = milvus_client.get_collection_stats(settings.TEXT_COLLECTION)
+            count = stats.get("row_count", 0)
+            if count == 0:
+                logger.info("文本集合为空，触发重建...")
+                await rebuild_text_index()
             else:
                 text_store = Milvus(
                     embedding_function=embeddings,
-                    collection_name=TEXT_COLLECTION,
-                    connection_args={"uri": MILVUS_URI},
+                    collection_name=settings.TEXT_COLLECTION,
+                    connection_args={"uri": settings.MILVUS_URI},
                 )
-                print(f"✅ 加载已有文本索引 ({text_count} 条)")
+                logger.info(f"✅ 加载已有文本索引 ({count} 条)")
         else:
-            # 首次启动，重建
-            image_client.close()
-            connections.disconnect("image_conn")
-            rebuild_text_index()
+            await rebuild_text_index()
 
-        if not has_image:
-            rebuild_image_index()
+        # 图片索引处理
+        if not milvus_client.has_collection(settings.IMAGE_COLLECTION):
+            await rebuild_image_index()
         else:
-            # 重新连接并加载
-            connections.connect(alias="image_conn", uri=MILVUS_URI)
-            image_client = MilvusClient(alias="image_conn")
-            image_client.load_collection(IMAGE_COLLECTION)
-            print(f"✅ 加载已有图片索引: {IMAGE_COLLECTION}")
+            milvus_client.load_collection(settings.IMAGE_COLLECTION)
+            logger.info(f"✅ 加载已有图片索引: {settings.IMAGE_COLLECTION}")
 
         stats = get_kb_stats()
-        print(f"📊 知识库状态: {stats.get('text_chunks', 0)} 文本块, {stats.get('images', 0)} 张图片")
+        logger.info(f"📊 知识库状态: {stats.get('text_chunks', 0)} 文本块, {stats.get('images', 0)} 张图片")
+        ready = True
 
     except Exception as e:
-        print(f"⚠️ 初始化异常: {e}")
-        print("⚠️ 请确保 Milvus 服务已启动 (docker compose up -d)")
+        logger.error(f"⚠️ 初始化失败: {e}\n{traceback.format_exc()}")
+        ready = False
 
     yield
 
-    print("🛑 服务关闭，释放资源...")
-    try:
-        connections.disconnect("image_conn")
-    except Exception:
-        pass
+    logger.info("🛑 服务关闭，释放资源...")
+    if milvus_client:
+        try:
+            milvus_client.close()
+        except Exception:
+            pass
+    ready = False
 
 
 # ── FastAPI App ──────────────────────────────────
 app = FastAPI(
-    title="Beauty Agent — 美妆护肤 AI 助手",
-    description="RAG 知识库 + Agent 自主推理 + 多模态检索 + Token 鉴权",
-    version="3.0.0",
+    title="Beauty Agent — 美妆护肤 AI 助手 (企业版)",
+    description="RAG 知识库 + Agent 自主推理 + 多模态检索 + Token 鉴权 + 生产级优化",
+    version="3.1.0",
     lifespan=lifespan,
 )
 
+# 静态文件
+app.mount("/static/images", StaticFiles(directory=settings.IMAGE_DIR), name="images")
 
-# ── 静态资源 ──────────────────────────────────────
-# 将 images/ 目录暴露为 HTTP 可访问的静态资源，解决前端 file:// 跨域问题
-app.mount("/static/images", StaticFiles(directory=IMAGE_DIR), name="images")
-app.mount("/static/chat_uploads", StaticFiles(directory=CHAT_UPLOAD_DIR), name="chat_uploads")
+# ── 请求/响应模型 ──────────────────────────────
+class ChatHistoryMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(..., min_length=1, max_length=4000)
 
 
-# ── 请求模型 ──────────────────────────────────────
 class ChatRequest(BaseModel):
-    question: str
+    question: str = Field(..., min_length=1, max_length=2000)
+    image_filename: Optional[str] = Field(default=None, max_length=255)
+    history: List[ChatHistoryMessage] = Field(default_factory=list, max_length=8)
+
 
 class ChatResponse(BaseModel):
     answer: str
-    rerank_scores: Optional[List[dict]] = None
-    images: Optional[List[dict]] = None
+    images: Optional[List[Dict[str, Any]]] = None
     context_sources: Optional[List[str]] = None
+    safety_notice: Optional[str] = None
 
-
-# ── Agent 请求模型 ────────────────────────────────────
 class AgentStep(BaseModel):
     tool: str = ""
-    args: dict = {}
+    args: Dict[str, Any] = Field(default_factory=dict)
     result_summary: str = ""
 
 class AgentResponse(BaseModel):
     answer: str = ""
-    steps: List[AgentStep] = []
-    images: List[dict] = []
+    steps: List[AgentStep] = Field(default_factory=list)
+    images: List[dict] = Field(default_factory=list)
+    safety_notice: Optional[str] = None
 
 
-@app.post("/api/v1/rag/chat", response_model=ChatResponse)
-async def chat_endpoint(
-    req: ChatRequest,
-    _=Depends(verify_token),
-):
-    """RAG 对话（含 BGE 重排 + 多模态检索）"""
+def _require_ready() -> None:
+    if not ready or text_store is None:
+        raise HTTPException(status_code=503, detail="AI 服务正在启动，请稍后重试")
+
+
+def _validated_question(req: ChatRequest) -> str:
     try:
-        return await chat_with_rerank(req.question)
+        return clean_question(req.question)
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _resolve_chat_image(image_filename: Optional[str]) -> Optional[str]:
+    if not image_filename:
+        return None
+    try:
+        safe_name = sanitize_filename(
+            image_filename,
+            {".jpg", ".jpeg", ".png", ".webp", ".bmp"},
+        )
+        if safe_name != image_filename or not safe_name.startswith("chat_"):
+            raise UploadValidationError("图片引用无效")
+        path = ensure_within_directory(settings.CHAT_UPLOAD_DIR, safe_name)
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="上传的图片不存在或已过期")
+    return str(path)
+
+
+def _history_for_agent(req: ChatRequest) -> List[Dict[str, str]]:
+    history: List[Dict[str, str]] = []
+    for item in req.history[-8:]:
+        role = item.role
+        content = item.content
+        if content.strip():
+            history.append({"role": role, "content": content.strip()[:4000]})
+    return history
+
+
+def _normalize_uploaded_image(file_bytes: bytes, extension: str) -> bytes:
+    """验证图片并移除 EXIF/GPS 等可能泄露隐私的元数据。"""
+    try:
+        normalized = normalize_image_bytes(file_bytes, extension)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="上传内容不是有效图片") from exc
+    if not normalized:
+        raise HTTPException(status_code=400, detail="上传内容不是有效图片")
+    return normalized
+
+
+# ── 健康检查 ────────────────────────────────────
+@app.get("/health")
+async def health():
+    status = {
+        "status": "ok" if ready else "not_ready",
+        "milvus": "connected" if milvus_client else "disconnected",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    return JSONResponse(content=status, status_code=200 if ready else 503)
+
+
+@app.get("/api/v1/privacy")
+async def privacy_policy():
+    """公开展示数据用途和安全边界，供用户在上传前查看。"""
+    return {
+        "image_retention_hours": settings.CHAT_UPLOAD_RETENTION_HOURS,
+        "image_access": "仅允许携带 Bearer Token 的 API 请求读取",
+        "image_metadata": "上传图片会重新编码并移除 EXIF/GPS 元数据",
+        "external_processing": "聊天文本和皮肤图片可能发送到配置的外部模型服务",
+        "medical_scope": "仅提供一般护肤信息，不进行疾病诊断，不替代医生",
+        "user_control": "用户可以删除当前聊天图片，系统也会自动清理过期图片",
+    }
+
+
+# ── RAG 端点（鉴权）──────────────────────────────
+@app.post("/api/v1/rag/chat", response_model=ChatResponse)
+async def chat_endpoint(req: ChatRequest, _=Depends(verify_token)):
+    _require_ready()
+    try:
+        result = await chat_with_rerank(_validated_question(req))
+        return result
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"RAG 异常: {str(e)}")
+    except Exception:
+        logger.exception("RAG 对话异常")
+        raise HTTPException(status_code=500, detail="RAG 服务暂时不可用，请稍后重试")
 
 
 @app.post("/api/v1/rag/chat/stream")
 async def chat_stream_endpoint(req: ChatRequest, _=Depends(verify_token)):
-    """流式 RAG 对话（SSE 打字机效果）"""
+    _require_ready()
+    question = _validated_question(req)
+
     async def event_generator():
         try:
-            async for chunk in chat_with_rerank_stream(req.question):
+            async for chunk in chat_with_rerank_stream(question):
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
+            logger.exception("流式对话异常")
+            yield f"data: {json.dumps({'type': 'error', 'content': '暂时无法完成回答，请稍后重试'}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -507,58 +604,65 @@ async def chat_stream_endpoint(req: ChatRequest, _=Depends(verify_token)):
     )
 
 
-# ── Agent 端点 ─────────────────────────────────────
+# ── Agent 端点 ─────────────────────────────────
 @app.post("/api/v1/agent/chat", response_model=AgentResponse)
-async def agent_chat_endpoint(
-    req: ChatRequest,
-    _=Depends(verify_token),
-):
-    """Agent 对话（自主推理 + 工具调用）— 基于 LangChain create_agent()"""
+async def agent_chat_endpoint(req: ChatRequest, _=Depends(verify_token)):
+    _require_ready()
     try:
+        question = _validated_question(req)
         result = await run_agent(
-            user_query=req.question,
+            user_query=question,
             llm=llm,
             text_store=text_store,
             rerank_func=rerank_documents,
-            milvus_uri=MILVUS_URI,
-            image_collection=IMAGE_COLLECTION,
+            milvus_uri=settings.MILVUS_URI,
+            image_collection=settings.IMAGE_COLLECTION,
             stats_func=get_kb_stats,
             vision_llm=vision_llm,
+            chat_history=_history_for_agent(req),
+            image_path=_resolve_chat_image(req.image_filename),
         )
         return AgentResponse(
             answer=result["answer"],
             steps=[AgentStep(**s) for s in result["steps"]],
             images=result["images"],
+            safety_notice=result.get("safety_notice"),
         )
     except HTTPException:
         raise
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Agent 异常: {str(e)}")
+    except Exception:
+        logger.exception("Agent 对话异常")
+        raise HTTPException(status_code=500, detail="Agent 服务暂时不可用，请稍后重试")
 
 
 @app.post("/api/v1/agent/chat/stream")
 async def agent_chat_stream_endpoint(req: ChatRequest, _=Depends(verify_token)):
-    """Agent 流式对话（SSE，逐步推送思考过程 + 答案）— 基于 LangChain create_agent()"""
+    _require_ready()
+    question = _validated_question(req)
+    image_path = _resolve_chat_image(req.image_filename)
+    history = _history_for_agent(req)
+
     async def event_generator():
         try:
             async for event in run_agent_stream(
-                user_query=req.question,
+                user_query=question,
                 llm=llm,
                 text_store=text_store,
                 rerank_func=rerank_documents,
-                milvus_uri=MILVUS_URI,
-                image_collection=IMAGE_COLLECTION,
+                milvus_uri=settings.MILVUS_URI,
+                image_collection=settings.IMAGE_COLLECTION,
                 stats_func=get_kb_stats,
                 vision_llm=vision_llm,
+                chat_history=history,
+                image_path=image_path,
             ):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 if event.get("type") == "done":
                     break
             yield "data: [DONE]\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
+        except Exception:
+            logger.exception("Agent 流式异常")
+            yield f"data: {json.dumps({'type': 'error', 'content': 'Agent 暂时无法完成回答，请稍后重试'}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -571,149 +675,190 @@ async def agent_chat_stream_endpoint(req: ChatRequest, _=Depends(verify_token)):
     )
 
 
+# ── 知识库管理（全部加鉴权）────────────────────
 @app.post("/api/v1/knowledge/upload")
 async def upload_knowledge(
     file: UploadFile = File(...),
+    _=Depends(verify_token),
 ):
-    """上传文档或图片到知识库（MD5 去重 + 增量入库）"""
-    filename = file.filename
-    ext = os.path.splitext(filename)[1].lower()
-
     image_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
     doc_exts = {".txt", ".pdf", ".docx", ".xlsx"}
+    try:
+        filename = sanitize_filename(file.filename or "", image_exts | doc_exts)
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     file_bytes = await file.read()
+    max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="上传文件不能为空")
+    if len(file_bytes) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"文件大小不能超过 {settings.MAX_UPLOAD_SIZE_MB}MB")
+
+    ext = Path(filename).suffix.lower()
     file_md5 = compute_md5(file_bytes)
 
     if ext in image_exts:
-        save_path = os.path.join(IMAGE_DIR, filename)
+        file_bytes = _normalize_uploaded_image(file_bytes, ext)
+        file_md5 = compute_md5(file_bytes)
+        stored_name = f"{Path(filename).stem}_{file_md5[:10]}{ext}"
+        save_path = ensure_within_directory(settings.IMAGE_DIR, stored_name)
+        if save_path.exists():
+            logger.info(f"⏭️ 图片已存在，跳过: {stored_name}")
+            return {"status": "ok", "type": "image", "filename": stored_name, "dedup": True}
 
-        # MD5 去重：内容相同跳过
-        if os.path.exists(save_path):
-            with open(save_path, "rb") as f:
-                if compute_md5(f.read()) == file_md5:
-                    print(f"⏭️ 图片已存在，跳过: {filename}")
-                    return {"status": "ok", "type": "image", "filename": filename, "dedup": True}
-
-        with open(save_path, "wb") as f:
-            f.write(file_bytes)
+        await asyncio.to_thread(save_path.write_bytes, file_bytes)
 
         try:
-            vec = embed_image(save_path)
-            connections.connect(alias="image_conn", uri=MILVUS_URI)
-            ic = MilvusClient(alias="image_conn")
-            ic.insert(
-                collection_name=IMAGE_COLLECTION,
+            vec = await asyncio.to_thread(embed_image, str(save_path))
+            if milvus_client is None:
+                raise RuntimeError("Milvus 客户端未初始化")
+            await asyncio.to_thread(
+                milvus_client.insert,
+                collection_name=settings.IMAGE_COLLECTION,
                 data=[{
                     "vector": vec.tolist(),
-                    "filepath": save_path,
-                    "filename": filename,
-                }]
+                    "filepath": str(save_path),
+                    "filename": stored_name,
+                }],
             )
-            ic.close()
-            connections.disconnect("image_conn")
-            print(f"✅ 图片已入库: {filename}")
-            return {"status": "ok", "type": "image", "filename": filename}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"图片处理失败: {str(e)}")
+            await asyncio.to_thread(milvus_client.flush, collection_name=settings.IMAGE_COLLECTION)
+            logger.info(f"✅ 图片已入库: {stored_name}")
+            return {"status": "ok", "type": "image", "filename": stored_name}
+        except Exception:
+            logger.exception("图片处理失败")
+            raise HTTPException(status_code=500, detail="图片处理失败，请稍后重试")
 
     elif ext in doc_exts:
-        save_path = os.path.join(KNOWLEDGE_DIR, filename)
-
-        # MD5 去重：内容相同跳过
+        save_path = ensure_within_directory(settings.KNOWLEDGE_DIR, filename)
+        was_existing = save_path.exists()
         if os.path.exists(save_path):
-            with open(save_path, "rb") as f:
-                if compute_md5(f.read()) == file_md5:
-                    print(f"⏭️ 文档已存在，跳过: {filename}")
-                    return {"status": "ok", "type": "document", "filename": filename, "dedup": True}
+            existing_md5 = compute_md5(await asyncio.to_thread(save_path.read_bytes))
+            if existing_md5 == file_md5:
+                logger.info(f"⏭️ 文档已存在，跳过: {filename}")
+                return {"status": "ok", "type": "document", "filename": filename, "dedup": True}
 
-        with open(save_path, "wb") as f:
-            f.write(file_bytes)
+        await asyncio.to_thread(save_path.write_bytes, file_bytes)
 
-        # 增量添加（无需全量重建）
         try:
-            from utils.document_loader import load_single_file
-            new_docs = load_single_file(save_path)
+            new_docs = await asyncio.to_thread(load_single_file, str(save_path))
             if not new_docs:
                 raise RuntimeError(f"文件 {filename} 解析后内容为空")
             chunked = chunk_documents(new_docs)
-            if text_store is not None:
-                text_store.add_documents(chunked)
-                print(f"✅ 文档增量入库: {filename} → {len(chunked)} 个切片")
+            if was_existing:
+                # 替换同名文件时全量重建，避免旧内容残留在向量库中。
+                await rebuild_text_index()
+            elif text_store is not None:
+                async with rebuild_lock:  # 添加文档时不希望并发重建
+                    await asyncio.to_thread(text_store.add_documents, chunked)
+                # 强制 flush 确保实时可见
+                if milvus_client:
+                    await asyncio.to_thread(milvus_client.flush, collection_name=settings.TEXT_COLLECTION)
+                logger.info(f"✅ 文档增量入库: {filename} → {len(chunked)} 个切片")
             else:
-                rebuild_text_index()
+                await rebuild_text_index()
             return {"status": "ok", "type": "document", "filename": filename}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"文档处理失败: {str(e)}")
-
+        except Exception:
+            logger.exception("文档处理失败")
+            raise HTTPException(status_code=500, detail="文档处理失败，请检查文件内容后重试")
     else:
         raise HTTPException(status_code=400, detail=f"不支持的文件格式: {ext}")
 
 
 @app.post("/api/v1/knowledge/rebuild")
-async def rebuild_knowledge():
-    """全量重建所有索引"""
+async def rebuild_knowledge(_=Depends(verify_token)):
     try:
-        rebuild_text_index()
-        rebuild_image_index()
+        await rebuild_text_index()
+        await rebuild_image_index()
         return {"status": "ok", "message": "全量索引重建完成"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"重建失败: {str(e)}")
+    except Exception:
+        logger.exception("重建索引失败")
+        raise HTTPException(status_code=500, detail="重建索引失败，请检查 Milvus 和知识库文件")
 
 
 @app.get("/api/v1/knowledge/stats")
-async def knowledge_stats():
-    """知识库统计（公开）"""
+async def knowledge_stats(_=Depends(verify_token)):
     return get_kb_stats()
 
 
 @app.get("/api/v1/auth/token")
-async def show_token():
-    """查看当前 API Token（仅首次启动时查看用）"""
-    return {"token": get_api_token()}
+async def show_token(_=Depends(verify_token)):
+    """兼容旧客户端，但不再通过公开接口返回 Token。"""
+    return {"configured": bool(get_api_token())}
 
 
 # ── 聊天图片上传 ─────────────────────────────────
 @app.post("/api/v1/chat/upload_image")
-async def chat_upload_image(file: UploadFile = File(...)):
-    """上传聊天中的图片，返回可访问的路径"""
-    filename = file.filename or f"chat_{int(time.time())}.jpg"
-    ext = os.path.splitext(filename)[1].lower()
-    if ext not in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
-        raise HTTPException(status_code=400, detail=f"不支持的图片格式: {ext}")
-
-    # 用时间戳防重名
-    safe_name = f"chat_{int(time.time())}_{hashlib.md5(filename.encode()).hexdigest()[:8]}{ext}"
-    save_path = os.path.join(CHAT_UPLOAD_DIR, safe_name)
+async def chat_upload_image(
+    file: UploadFile = File(...),
+    _=Depends(verify_token),
+):
+    await asyncio.to_thread(
+        cleanup_expired_files,
+        settings.CHAT_UPLOAD_DIR,
+        settings.CHAT_UPLOAD_RETENTION_HOURS,
+    )
+    try:
+        filename = sanitize_filename(
+            file.filename or f"chat_{int(time.time())}.jpg",
+            {".jpg", ".jpeg", ".png", ".webp", ".bmp"},
+        )
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    ext = Path(filename).suffix.lower()
 
     file_bytes = await file.read()
-    with open(save_path, "wb") as f:
-        f.write(file_bytes)
+    max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="上传图片不能为空")
+    if len(file_bytes) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"文件大小不能超过 {settings.MAX_UPLOAD_SIZE_MB}MB")
+
+    file_bytes = _normalize_uploaded_image(file_bytes, ext)
+    if len(file_bytes) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"文件大小不能超过 {settings.MAX_UPLOAD_SIZE_MB}MB")
+    safe_name = f"chat_{uuid4().hex}{ext}"
+    save_path = ensure_within_directory(settings.CHAT_UPLOAD_DIR, safe_name)
+    await asyncio.to_thread(save_path.write_bytes, file_bytes)
 
     return {
         "status": "ok",
-        "path": save_path,
-        "url": f"/static/chat_uploads/{safe_name}",
+        "file_id": safe_name,
+        "url": f"/api/v1/chat/uploads/{safe_name}",
         "filename": safe_name,
     }
 
 
-# ── 兼容旧版端点 ────────────────────────────────
-class LegacyChatRequest(BaseModel):
-    question: str
+@app.get("/api/v1/chat/uploads/{file_id}")
+async def get_chat_upload(file_id: str, _=Depends(verify_token)):
+    """受鉴权保护的聊天图片读取接口，不再通过公开静态目录暴露。"""
+    path = _resolve_chat_image(file_id)
+    media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    return FileResponse(path, media_type=media_type)
 
+
+@app.delete("/api/v1/chat/uploads/{file_id}")
+async def delete_chat_upload(file_id: str, _=Depends(verify_token)):
+    """允许用户主动删除本次聊天上传的图片。"""
+    path = _resolve_chat_image(file_id)
+    await asyncio.to_thread(path.unlink)
+    return {"status": "deleted", "file_id": file_id}
+
+
+# ── 兼容旧版 ─────────────────────────────────────
 @app.post("/chat")
-async def legacy_chat(req: LegacyChatRequest):
-    """兼容旧版 /chat 端点（无鉴权）"""
+async def legacy_chat(req: ChatRequest, _=Depends(verify_token)):
+    """兼容旧版 /chat 端点，但沿用鉴权和输入校验。"""
+    _require_ready()
     try:
-        result = await chat_with_rerank(req.question)
+        result = await chat_with_rerank(_validated_question(req))
         return {"answer": result["answer"]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"集群或大模型异常: {str(e)}")
+    except Exception:
+        logger.exception("旧版对话异常")
+        raise HTTPException(status_code=500, detail="服务暂时不可用，请稍后重试")
 
 
-# ── 启动入口 ──────────────────────────────────────
+# ── 启动入口 ─────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("API_PORT", "8000"))
-    uvicorn.run("main:app", host="127.0.0.1", port=port, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=settings.API_PORT, reload=False)

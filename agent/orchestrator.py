@@ -11,6 +11,8 @@ create_agent() 内部自动处理:
   - 停止条件判断
 """
 
+import asyncio
+import logging
 from typing import AsyncGenerator, List, Dict, Any, Optional
 
 from langchain.agents import create_agent
@@ -22,6 +24,11 @@ from langchain_core.messages import (
 )
 
 from agent.tools import create_tools
+from utils.agent_events import parse_image_results, summarize_tool_result
+from utils.safety import SafetyAssessment, assess_question
+
+
+logger = logging.getLogger(__name__)
 
 
 # ── System Prompt ───────────────────────────────────────
@@ -48,7 +55,17 @@ AGENT_SYSTEM_PROMPT = """你是一位专业的美妆护肤顾问助手「Beauty 
 - 如果用户问题模糊，主动询问澄清细节
 - 回答格式清晰有条理，适当使用标题、列表
 - 如果用户上传了皮肤照片，请务必调用 analyze_skin 工具分析，不要只看文字描述
+- 不要把照片或文字描述当作疾病诊断依据，不要提供处方或药物剂量
+- 不要根据照片推断身份、年龄、种族、健康状态或“美丑”，只描述与护肤相关的可观察表现
+- 遇到严重、持续、快速恶化或不确定的症状，优先建议用户联系医生
 """
+
+
+def _build_system_prompt(assessment: SafetyAssessment, image_path: Optional[str]) -> str:
+    prompt = AGENT_SYSTEM_PROMPT + "\n\n安全指引：" + assessment.instruction
+    if image_path:
+        prompt += "\n当前用户已上传皮肤照片，请务必调用 analyze_skin 工具。"
+    return prompt
 
 
 # ── 消息构建 ───────────────────────────────────────────
@@ -107,13 +124,13 @@ def _parse_result(result: dict) -> Dict[str, Any]:
                     "result_summary": "已完成",
                 })
 
-    # 图片（search_images 工具返回的文本中可能包含图片信息）
+    # 图片（search_images 工具返回结构化 JSON）
     images = []
     for m in all_messages:
         if isinstance(m, ToolMessage) and m.name == "search_images":
-            content = str(m.content)
-            if "找到以下图片" in content:
-                images.append({"tool_result": content})
+            for image in parse_image_results(str(m.content)):
+                if image not in images:
+                    images.append(image)
 
     return {"answer": answer, "steps": steps, "images": images}
 
@@ -131,6 +148,7 @@ async def run_agent(
     stats_func=None,
     vision_llm=None,
     chat_history: Optional[List[Dict]] = None,
+    image_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """运行 Agent 自主推理（非流式）。
 
@@ -144,6 +162,7 @@ async def run_agent(
         stats_func:      统计函数
         vision_llm:      视觉模型
         chat_history:    多轮历史 [{"role":"user"|"assistant", "content":...}]
+        image_path:      已由 API 校验的用户上传图片路径
 
     返回:
         {"answer": str, "steps": [...], "images": [...]}
@@ -156,23 +175,27 @@ async def run_agent(
         image_collection=image_collection,
         stats_func=stats_func,
         vision_llm=vision_llm,
+        image_path=image_path,
     )
 
     # 2. 构建初始消息
     messages = _build_messages(chat_history=chat_history, user_query=user_query)
 
     # 3. 创建 Agent（LangChain 官方 API）
+    assessment = assess_question(user_query)
     agent = create_agent(
         model=llm,
         tools=tools,
-        system_prompt=AGENT_SYSTEM_PROMPT,
+        system_prompt=_build_system_prompt(assessment, image_path),
     )
 
     # 4. 运行
-    result = agent.invoke({"messages": messages})
+    result = await asyncio.to_thread(agent.invoke, {"messages": messages})
 
     # 5. 解析返回
-    return _parse_result(result)
+    parsed = _parse_result(result)
+    parsed["safety_notice"] = assessment.notice or None
+    return parsed
 
 
 # ═════════════════════════════════════════════════════════
@@ -188,10 +211,12 @@ async def run_agent_stream(
     stats_func=None,
     vision_llm=None,
     chat_history: Optional[List[Dict]] = None,
+    image_path: Optional[str] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """运行 Agent 自主推理（流式），逐步 yield 事件。
 
     yield 事件类型:
+        {"type": "safety", "content": str}
         {"type": "step", "tool": str, "args": dict}
         {"type": "text",  "content": str}
         {"type": "done"}
@@ -205,20 +230,26 @@ async def run_agent_stream(
         image_collection=image_collection,
         stats_func=stats_func,
         vision_llm=vision_llm,
+        image_path=image_path,
     )
 
     # 2. 构建初始消息
     messages = _build_messages(chat_history=chat_history, user_query=user_query)
 
     # 3. 创建 Agent
+    assessment = assess_question(user_query)
+    if assessment.notice:
+        yield {"type": "safety", "content": assessment.notice}
+
     agent = create_agent(
         model=llm,
         tools=tools,
-        system_prompt=AGENT_SYSTEM_PROMPT,
+        system_prompt=_build_system_prompt(assessment, image_path),
     )
 
     # 4. 流式运行 — stream_mode="updates" 返回每步增量
     seen_tool_calls = set()
+    seen_tool_messages = set()
     try:
         async for chunk in agent.astream(
             {"messages": messages},
@@ -244,7 +275,23 @@ async def run_agent_stream(
                     elif isinstance(m, AIMessage) and m.content and not m.tool_calls:
                         yield {"type": "text", "content": str(m.content)}
 
+                    elif isinstance(m, ToolMessage):
+                        message_key = getattr(m, "id", None) or f"{m.name}:{hash(str(m.content))}"
+                        if message_key in seen_tool_messages:
+                            continue
+                        seen_tool_messages.add(message_key)
+                        content = str(m.content)
+                        yield {
+                            "type": "step_result",
+                            "tool": m.name or "unknown",
+                            "summary": summarize_tool_result(content),
+                        }
+                        images = parse_image_results(content)
+                        if images:
+                            yield {"type": "images", "images": images}
+
         yield {"type": "done"}
 
-    except Exception as e:
-        yield {"type": "error", "content": str(e)}
+    except Exception:
+        logger.exception("Agent 流式执行失败")
+        yield {"type": "error", "content": "Agent 暂时无法完成回答，请稍后重试"}

@@ -12,10 +12,15 @@ Agent 工具定义层 — 使用 LangChain 官方 @tool 装饰器
 
 import os
 import base64
+import json
+import logging
 from typing import List, Optional
 
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
+
+
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -29,6 +34,7 @@ def create_tools(
     image_collection: str = "image_embeddings",
     stats_func=None,
     vision_llm=None,
+    image_path: Optional[str] = None,
 ) -> list:
     """
     创建 Agent 工具列表。
@@ -40,7 +46,10 @@ def create_tools(
         image_collection: 图片集合名称
         stats_func:   get_kb_stats 函数引用
         vision_llm:   视觉模型 ChatOpenAI 实例
+        image_path:   当前用户上传的皮肤图片（由服务端校验后注入）
     """
+
+    image_path_from_request = image_path
 
     # ── 1. search_knowledge_base ──────────────────────────
     @tool
@@ -54,8 +63,18 @@ def create_tools(
         if text_store is None:
             return "错误：知识库引擎未初始化"
 
+        query = str(query or "").strip()[:500]
+        try:
+            top_k = max(1, min(int(top_k), 10))
+        except (TypeError, ValueError):
+            top_k = 5
+
         # 粗召回 top 10
-        raw_docs = text_store.similarity_search(query, k=10)
+        try:
+            raw_docs = text_store.similarity_search(query, k=10)
+        except Exception:
+            logger.exception("知识库检索失败")
+            return "知识库检索暂时不可用，请稍后重试"
 
         # BGE 重排精排
         if rerank_func:
@@ -63,6 +82,7 @@ def create_tools(
                 reranked = rerank_func(query, raw_docs, top_k=min(top_k, 5))
                 top_docs = [item[0] for item in reranked]
             except Exception:
+                logger.exception("知识库重排失败")
                 top_docs = raw_docs[: min(top_k, 5)]
         else:
             top_docs = raw_docs[: min(top_k, 5)]
@@ -94,12 +114,13 @@ def create_tools(
             query: 图片描述关键字，如"控油面膜"、"口红试色"
             limit: 返回图片数量 (1-10)，默认 5
         """
-        from pymilvus import connections, MilvusClient
+        from pymilvus import MilvusClient
         from utils.multimodal import embed_text_for_image_search
 
+        limit = max(1, min(int(limit), 10))
+        ic = None
         try:
-            connections.connect(alias="agent_img_search", uri=milvus_uri)
-            ic = MilvusClient(alias="agent_img_search")
+            ic = MilvusClient(uri=milvus_uri)
 
             query_vec = embed_text_for_image_search(query)
             img_results = ic.search(
@@ -115,17 +136,28 @@ def create_tools(
                     score = round(hit["distance"], 4)
                     if score >= 0.15:
                         matched.append(
-                            f"  - {hit['entity']['filename']} (相关度: {score})"
+                            {
+                                "filename": hit["entity"]["filename"],
+                                "score": score,
+                            }
                         )
 
-            ic.close()
-            connections.disconnect("agent_img_search")
-
-            if not matched:
-                return "未找到匹配的图片"
-            return "找到以下图片：\n" + "\n".join(matched)
-        except Exception as e:
-            return f"图片搜索异常: {e}"
+            return json.dumps(
+                {
+                    "message": f"找到 {len(matched)} 张匹配图片" if matched else "未找到匹配的图片",
+                    "images": matched,
+                },
+                ensure_ascii=False,
+            )
+        except Exception:
+            logger.exception("图片搜索失败")
+            return "图片搜索暂时不可用，请稍后重试"
+        finally:
+            if ic is not None:
+                try:
+                    ic.close()
+                except Exception:
+                    pass
 
     # ── 3. get_knowledge_base_stats ───────────────────────
     @tool
@@ -143,28 +175,28 @@ def create_tools(
                 f"  - 图片素材: {s.get('images', 0)} 张\n"
                 f"  - 源文档: {s.get('documents', 0)} 个"
             )
-        except Exception as e:
-            return f"获取统计失败: {e}"
+        except Exception:
+            logger.exception("知识库统计失败")
+            return "知识库统计暂时不可用，请稍后重试"
 
     # ── 4. analyze_skin ───────────────────────────────────
     @tool
-    def analyze_skin(image_path: str) -> str:
+    def analyze_skin() -> str:
         """分析用户上传的皮肤照片，识别肤质类型、皮肤问题，并给出护肤建议。
         当用户上传了面部/皮肤照片并希望分析时调用此工具。
-
-        Args:
-            image_path: 皮肤照片的本地文件路径
         """
         if vision_llm is None:
             return "错误：视觉分析模型未初始化"
-        if not image_path or not os.path.exists(image_path):
-            return f"错误：图片不存在 — {image_path}"
+        # 路径只允许使用 API 校验后注入的文件，不能让模型自行读取本地任意路径。
+        selected_path = image_path_from_request
+        if not selected_path or not os.path.exists(selected_path):
+            return "错误：当前对话没有可用的皮肤照片"
 
         try:
-            with open(image_path, "rb") as f:
+            with open(selected_path, "rb") as f:
                 b64_img = base64.b64encode(f.read()).decode("utf-8")
 
-            ext = os.path.splitext(image_path)[1].lower()
+            ext = os.path.splitext(selected_path)[1].lower()
             mime_map = {
                 ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                 ".png": "image/png", ".webp": "image/webp",
@@ -175,11 +207,12 @@ def create_tools(
                 {
                     "type": "text",
                     "text": (
-                        "你是一位专业皮肤科顾问。请分析这张皮肤照片，给出以下内容：\n"
-                        "1. 肤质类型（干性/油性/混合性/中性/敏感肌）\n"
-                        "2. 皮肤问题（痘痘/黑头/泛红/暗沉/细纹/毛孔粗大等）\n"
-                        "3. 护肤建议（包括成分推荐和注意事项）\n"
-                        "请用中文回答，专业但易懂。"
+                        "你是一位谨慎的护肤信息助手。请仅描述照片中可观察到的外观特征，给出以下内容：\n"
+                        "1. 可能的肤质表现（干燥、油光、混合等），避免把观察结果当成诊断\n"
+                        "2. 可见的皮肤表现（如痘痘、黑头、泛红、暗沉、细纹、毛孔等）\n"
+                        "3. 一般性的护肤建议（包括成分注意事项，不给处方或药物剂量）\n"
+                        "不要根据照片推断身份、年龄、种族、健康状态或美丑，只讨论与护肤有关的可观察表现。\n"
+                        "请用中文回答，专业但易懂。明确说明这不是医疗诊断；若有严重、持续或不确定的症状，请咨询医生。"
                     ),
                 },
                 {
@@ -189,8 +222,9 @@ def create_tools(
             ])
             response = vision_llm.invoke([msg])
             return response.content or "分析失败"
-        except Exception as e:
-            return f"皮肤分析异常: {e}"
+        except Exception:
+            logger.exception("皮肤分析失败")
+            return "皮肤分析暂时不可用，请稍后重试"
 
     return [
         search_knowledge_base,
