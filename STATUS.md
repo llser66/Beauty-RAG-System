@@ -22,6 +22,8 @@
 - 更新 README、项目说明、环境模板和前端交互，公开隐私说明接口为 `/api/v1/privacy`；
 - 保留并区分用户已有的两个 PNG 删除状态，未覆盖无关工作区改动。
 
+- 已部署 Render 公网演示服务：https://beauty-agent-demo.onrender.com，使用单容器 FastAPI + Streamlit；
+
 ## 已执行检查
 
 - `python -m pytest -q -p no:cacheprovider tests`：15 passed；
@@ -40,5 +42,5 @@
 
 1. 用户启动前端后，使用测试图片验证“同意提示 → 上传 → 对话 → 删除”完整流程；
 2. 针对真实模型响应补充一次人工验收，确认医疗提示和图片展示符合预期；
-3. 已补充 Render 公网演示模式：单容器运行 FastAPI + Streamlit，演示知识库不依赖 Milvus；
-4. 公网部署仍需在 Render 配置 SiliconFlow API Key，并注意免费实例休眠、临时文件不持久化和外部模型数据处理政策。
+3. 已补充并部署 Render 公网演示模式：单容器运行 FastAPI + Streamlit，演示知识库不依赖 Milvus；
+4. 若作为正式产品继续运营，还需配置持久化向量库、限流、审计日志脱敏和正式密钥管理。

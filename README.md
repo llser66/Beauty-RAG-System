@@ -168,6 +168,7 @@ python -m py_compile main.py app_frontend.py agent\tools.py agent\orchestrator.p
 
 仓库现在包含一个适合 Render 免费 Web Service 的演示模式：
 
+- 在线体验：[https://beauty-agent-demo.onrender.com](https://beauty-agent-demo.onrender.com)
 - DEMO_MODE=true 时使用 demo_knowledge_base/ 的轻量关键词检索，不启动 Milvus、CLIP 或 BGE 大模型；
 - Docker 容器会先启动 FastAPI，再启动 Streamlit，Render 的公网端口由 PORT 环境变量注入；
 - 需要在 Render 环境变量中配置 SILICONFLOW_API_KEY、SILICONFLOW_BASE_URL 和随机的 API_BEARER_TOKEN；
