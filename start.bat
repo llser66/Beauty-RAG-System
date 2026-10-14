@@ -70,7 +70,7 @@ echo  [OK] Backend health and privacy routes are ready
 REM 4. Start Frontend (port 8501)
 echo.
 echo  [..] Starting frontend (port 8501)...
-start "Beauty-Frontend" cmd /c "python -m streamlit run app_frontend.py"
+start "Beauty-Frontend" cmd /c "python -m streamlit run app_frontend.py --server.maxUploadSize 50"
 
 echo.
 echo  ========================================

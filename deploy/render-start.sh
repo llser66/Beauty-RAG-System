@@ -3,6 +3,7 @@ set -euo pipefail
 
 PUBLIC_PORT="${PORT:-10000}"
 API_PORT_VALUE="${API_PORT:-8877}"
+MAX_UPLOAD_SIZE_VALUE="${MAX_UPLOAD_SIZE_MB:-10}"
 API_PID=""
 FRONTEND_PID=""
 
@@ -44,6 +45,7 @@ echo "[Beauty RAG] starting Streamlit on 0.0.0.0:${PUBLIC_PORT}"
 python -m streamlit run app_frontend.py \
   --server.address=0.0.0.0 \
   --server.port="${PUBLIC_PORT}" \
+  --server.maxUploadSize="${MAX_UPLOAD_SIZE_VALUE}" \
   --server.headless=true \
   --server.enableCORS=false \
   --server.enableXsrfProtection=false &

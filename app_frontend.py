@@ -29,6 +29,8 @@ st.set_page_config(
 API_BASE = os.getenv("API_BASE_URL", "http://127.0.0.1:8877").rstrip("/")
 API_TOKEN = os.getenv("API_BEARER_TOKEN", "").strip()
 CHAT_UPLOAD_RETENTION_HOURS = max(1, int(os.getenv("CHAT_UPLOAD_RETENTION_HOURS", "24")))
+MAX_UPLOAD_SIZE_MB = max(1, int(os.getenv("MAX_UPLOAD_SIZE_MB", "50")))
+DEMO_MODE = os.getenv("DEMO_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 COLORS = {
     "ink": "#211A25",
@@ -92,8 +94,16 @@ CSS = f"""
     }}
     section[data-testid="stSidebar"] .stButton > button:hover {{ background: rgba(255,255,255,.18) !important; }}
     section[data-testid="stSidebar"] [data-baseweb="select"] > div {{
-        background: rgba(255,255,255,.1) !important;
+        background: #FFFDFC !important;
         border-color: rgba(255,255,255,.18) !important;
+    }}
+    section[data-testid="stSidebar"] [data-baseweb="select"] [role="combobox"],
+    section[data-testid="stSidebar"] [data-baseweb="select"] input,
+    section[data-testid="stSidebar"] [data-baseweb="select"] span {{
+        color: #2E2230 !important;
+    }}
+    section[data-testid="stSidebar"] [data-baseweb="select"] svg {{
+        fill: #6C3D59 !important;
     }}
 
     .brand {{ display:flex; align-items:center; gap:.75rem; padding:.35rem .1rem 1.1rem; }}
@@ -113,6 +123,7 @@ CSS = f"""
     .sidebar-stat-label {{ color:#D9BBC5; font-size:.68rem; margin-top:.18rem; }}
     .sidebar-note {{ color:#D9BBC5; font-size:.76rem; line-height:1.65; }}
     .sidebar-status {{ font-size:.75rem; color:#D9BBC5; padding:.6rem .7rem; border-radius:10px; background:rgba(255,255,255,.06); }}
+    .demo-badge {{ display:inline-flex; align-items:center; gap:.35rem; margin:.1rem 0 .85rem; padding:.28rem .55rem; border:1px solid rgba(233,181,191,.35); border-radius:999px; color:#F6DDE2; background:rgba(233,181,191,.12); font-size:.66rem; letter-spacing:.04em; }}
 
     .topbar {{ display:flex; align-items:center; justify-content:space-between; margin:.25rem 0 1.25rem; }}
     .eyebrow {{ color:var(--rose); font-size:.7rem; letter-spacing:.16em; text-transform:uppercase; font-weight:700; }}
@@ -355,6 +366,8 @@ def _render_sidebar() -> dict[str, Any]:
             '<div class="brand"><div class="brand-mark">✦</div><div><div class="brand-title">Beauty Agent</div><div class="brand-sub">AI BEAUTY COMPANION</div></div></div>',
             unsafe_allow_html=True,
         )
+        if DEMO_MODE:
+            st.markdown('<div class="demo-badge">✦ 公网演示 · 轻量知识库</div>', unsafe_allow_html=True)
 
         st.markdown("### 对话模式")
         st.selectbox(
